@@ -1,26 +1,29 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"net/http"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 
-	"fast-sandbox/internal/ocitemplate"
 	"github.com/opencontainers/go-digest"
 	oci "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/spf13/cobra"
+
+	"fast-sandbox/internal/blobcache"
+	"fast-sandbox/internal/ocitemplate"
 )
 
-// Cache only immutable, already-published content. No devices or mounts are
-// retained here; imported blobs use the daemon's normal bounded file cache.
+// Cache only immutable, already-published content. Metadata lands in the
+// credential-scoped manifest cache; layer blobs move into the node-scoped blob
+// cache, which the next create names in the lowers' file field.
 func newCacheCheckpointCommand() *cobra.Command {
 	var published, authFile, artifacts string
 	cmd := &cobra.Command{Use: "cache-checkpoint", Short: "Cache a locally published OCI checkpoint", Hidden: true,
-		RunE: func(cmd *cobra.Command, _ []string) error {
+		RunE: func(_ *cobra.Command, _ []string) error {
 			raw, err := os.ReadFile(published)
 			if err != nil {
 				return err
@@ -37,7 +40,7 @@ func newCacheCheckpointCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return cacheCheckpoint(cmd.Context(), &result, config, artifacts, newUblkdClient(global.ublkdSocket))
+			return cacheCheckpoint(&result, config, artifacts)
 		}}
 	cmd.Flags().StringVar(&published, "published", "", "published immutable metadata file")
 	cmd.Flags().StringVar(&authFile, "docker-auth-file", "", "restore credential file")
@@ -48,7 +51,7 @@ func newCacheCheckpointCommand() *cobra.Command {
 	return cmd
 }
 
-func cacheCheckpoint(ctx context.Context, result *ocitemplate.PublishedCheckpoint, config dockerConfig, artifacts string, client *ublkdClient) error {
+func cacheCheckpoint(result *ocitemplate.PublishedCheckpoint, config dockerConfig, artifacts string) error {
 	ref, err := parseRegistryReference(strings.TrimPrefix(result.Reference, ocitemplate.Prefix))
 	if err != nil {
 		return err
@@ -60,7 +63,7 @@ func cacheCheckpoint(ctx context.Context, result *ocitemplate.PublishedCheckpoin
 	if pair.Snapfiles != strings.TrimPrefix(result.Reference, ocitemplate.Prefix) {
 		return fmt.Errorf("published checkpoint pair mismatch")
 	}
-	// Validate all manifests before writing metadata or requesting blob imports.
+	// Validate all manifests before writing metadata or moving any blob.
 	var layers []oci.Descriptor
 	for _, reference := range []string{pair.Rootfs, pair.Snapfiles} {
 		imageRef, err := parseRegistryReference(reference)
@@ -94,12 +97,16 @@ func cacheCheckpoint(ctx context.Context, result *ocitemplate.PublishedCheckpoin
 	if err := cacheManifestFile(path+".template", result.Metadata); err != nil {
 		return err
 	}
-	scheme := "https://"
-	if global.plainHTTP {
-		scheme = "http://"
-	}
-	base := scheme + ref.Registry + "/v2/" + ref.Repository + "/blobs/"
-	seen := map[digest.Digest]bool{}
+	return storeCheckpointLayers(layers, artifacts)
+}
+
+// storeCheckpointLayers moves the layers this node just packed into the blob
+// cache. Inherited layers never existed in the staging directory and stay
+// remote: the digest and size remain in the lower, so a missing file falls
+// back to the registry fetch.
+func storeCheckpointLayers(layers []oci.Descriptor, artifacts string) error {
+	root := blobCacheRoot()
+	seen := make(map[digest.Digest]bool, len(layers))
 	for _, layer := range layers {
 		if layer.Digest.Validate() != nil || layer.Digest.Algorithm() != digest.SHA256 || layer.Size <= 0 {
 			return fmt.Errorf("invalid checkpoint layer")
@@ -108,30 +115,14 @@ func cacheCheckpoint(ctx context.Context, result *ocitemplate.PublishedCheckpoin
 			continue
 		}
 		seen[layer.Digest] = true
-		path, err := filepath.Abs(filepath.Join(artifacts, "blobs/sha256", layer.Digest.Encoded()))
-		if err != nil {
+		source := filepath.Join(artifacts, "blobs/sha256", layer.Digest.Encoded())
+		if err := blobcache.Store(root, layer.Digest, layer.Size, source); err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				continue // inherited layer, never downloaded into this staging
+			}
 			return err
-		}
-		info, err := os.Stat(path)
-		if os.IsNotExist(err) {
-			continue
-		} // inherited layers already belong to the shared cache
-		if err != nil {
-			return err
-		}
-		if !info.Mode().IsRegular() || info.Size() != layer.Size {
-			return fmt.Errorf("local checkpoint layer size or type mismatch")
-		}
-		var response ublkdOKResponse
-		status, err := client.doStatus(ctx, http.MethodPost, "/v1/cache/import", map[string]any{
-			"path": path, "url": base + layer.Digest.String(), "digest": layer.Digest.String(), "size": layer.Size,
-		}, &response)
-		if err != nil {
-			return err
-		}
-		if status != http.StatusOK || !response.OK {
-			return fmt.Errorf("import checkpoint cache: status %d: %s", status, response.Error)
 		}
 	}
-	return nil
+	_, _, err := blobcache.Trim(root, blobcache.DefaultMaxBytes, blobcache.DefaultMinAge)
+	return err
 }

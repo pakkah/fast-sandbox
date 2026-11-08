@@ -141,6 +141,7 @@ Common global options:
 | `--kernel-dir` | `/opt/fsb-vm/kernels` | Default directory for `vmlinux-<version>` during create |
 | `--state-dir` | `/var/lib/fsb-vm/sandboxes` | Persistent sandbox state root |
 | `--manifest-cache-dir` | `<state-dir>/.manifest-cache` | Immutable registry metadata cache; may be shared independently of sandbox state |
+| `--blob-cache-dir` | `<state-dir>/.blob-cache` | Published layer blob cache for local resume; may be shared independently of sandbox state |
 | `--runtime-dir` | `/run/fsb-vm/sandboxes` | API socket and serial-log root |
 | `--firecracker` | `firecracker` | Firecracker executable |
 | `--overlaybd-convertor` | `/opt/overlaybd/snapshotter/convertor` | OCI userspace convertor |
@@ -305,6 +306,20 @@ This is separate from OverlayBD's block cache: each sandbox still gets its own
 writable upper and devices, and uncached blocks are read on demand by OverlayBD.
 
 Fastlet reads platform metadata from `manifest.json` in the mounted snapfiles filesystem. FastPath uses the create-request bindings and never queries the OCI registry for recorded policy. Opaque `policy.json` and `vault.json` remain node-side state imports.
+
+### Published layer blob cache
+
+Checkpoint publication keeps the layer blobs the node just packed in
+`<blob-cache-dir>/sha256/<digest>`, and the next `create` names each cached
+layer's file in the lowers it writes. OverlayBD opens that file instead of
+fetching the blob, while a missing file falls back to `repoBlobUrl`, so the
+cache never becomes a source of truth. Entries are content addressed and shared
+by every Sandbox on the node; only the runtime writes them, after a successful
+publication. `create` refreshes an entry's modification time when it writes a
+config that references it, and the runtime trims the cache after each
+publication to 16 GiB, least recently used first, never evicting a blob touched
+in the last ten minutes. Fastlet uses `<StateRoot>/oci/blobs`, so a Pod
+replacement keeps the bytes; remove that directory to clear the cache.
 
 ### 4.4 Disk size
 

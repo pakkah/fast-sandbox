@@ -141,6 +141,7 @@ go build -o "$FSB_VM" ./cmd/fsb-vm/
 | `--kernel-dir` | `/opt/fsb-vm/kernels` | `create` 默认查找 `vmlinux-<version>` 的目录 |
 | `--state-dir` | `/var/lib/fsb-vm/sandboxes` | 持久化 sandbox 状态根目录 |
 | `--manifest-cache-dir` | `<state-dir>/.manifest-cache` | 不可变 registry 元数据缓存，可独立于 sandbox 状态共享 |
+| `--blob-cache-dir` | `<state-dir>/.blob-cache` | 已发布层 blob 缓存，用于本地恢复，可独立于 sandbox 状态共享 |
 | `--runtime-dir` | `/run/fsb-vm/sandboxes` | API socket 和串口日志目录 |
 | `--firecracker` | `firecracker` | Firecracker 可执行文件 |
 | `--overlaybd-convertor` | `/opt/overlaybd/snapshotter/convertor` | OCI userspace convertor |
@@ -302,6 +303,10 @@ sudo "$FSB_VM" --plain-http build ...
 Fastlet 从挂载的 snapfiles 文件系统中的 `manifest.json` 读取平台信息。FastPath 使用 create 请求中的绑定，不再访问 OCI registry 读取策略；opaque `policy.json` 和 `vault.json` 由节点侧导入。
 
 `fsb-vm build` 无需平台输入也会生成唯一的 `snapfiles/manifest.json`，不再生成 `metadata.json`。`--manifest-extra-file` 只补充 `guestNetwork`、`lineage`、`platform`，禁止覆盖核心 VM 配置。OCI 和 S3 共用 [schemaVersion 1 模型](artifact-manifest-reference.md)；已有产物需重建，不提供旧格式兼容读取。
+
+### 已发布层 blob 缓存
+
+checkpoint 发布成功后，运行时会把本次打包的层 blob 移入 `<blob-cache-dir>/sha256/<digest>`，下一次 `create` 在写入的 lowers 中为命中的层带上本地文件路径。OverlayBD 直接打开该文件而不回源，文件缺失时回落到 `repoBlobUrl`，因此缓存不承载数据正确性。条目按内容寻址，同一节点上的 Sandbox 共享同一份字节；只有运行时在发布成功后写入，`fsb-vm` 自身不写入。`create` 写入引用该层的配置时刷新文件修改时间，运行时在每次发布后按最近最少使用淘汰到 16 GiB，最近十分钟内被访问过的 blob 不会被删除。Fastlet 使用 `<StateRoot>/oci/blobs`，Pod 重建后字节仍在；删除该目录即可清空缓存。
 
 ### 4.4 磁盘大小
 

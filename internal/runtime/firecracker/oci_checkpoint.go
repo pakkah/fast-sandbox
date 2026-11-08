@@ -153,7 +153,7 @@ func (d *Driver) publishOCISnapshot(ctx context.Context, plan dumpPlan, sizeByte
 	}
 	ref := published.Reference
 	// Cache population is best effort, but finishes before Paused is reported.
-	// Publication remains authoritative if the daemon is old, full or unavailable.
+	// Publication remains authoritative if the local cache cannot be written.
 	if err := d.cacheOCICheckpoint(ctx, plan.staging, plan.snapshotID, published); err != nil {
 		klog.ErrorS(err, "OCI checkpoint cache population skipped", "snapshotID", plan.snapshotID)
 	}

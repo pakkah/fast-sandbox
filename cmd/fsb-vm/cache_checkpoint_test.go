@@ -3,18 +3,20 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
 
-	"fast-sandbox/internal/ocitemplate"
 	"github.com/opencontainers/go-digest"
 	"github.com/stretchr/testify/require"
+
+	"fast-sandbox/internal/blobcache"
+	"fast-sandbox/internal/ocitemplate"
 )
 
-func TestCheckpointPublicationCacheReusedOfflineAndEvicted(t *testing.T) {
+func TestCheckpointPublicationCacheReusedOffline(t *testing.T) {
 	setupManifestCache(t)
+	global.blobCacheDir = t.TempDir()
 	root, snap := cacheTestManifest(t, "inherited"), cacheTestManifest(t, "new checkpoint")
 	registry := newManifestCacheRegistry(t, root)
 	registry.byDigest[digest.FromBytes(snap).String()] = snap
@@ -26,22 +28,13 @@ func TestCheckpointPublicationCacheReusedOfflineAndEvicted(t *testing.T) {
 	blob := filepath.Join(artifacts, "blobs/sha256", digest.FromString("new checkpoint").Encoded())
 	require.NoError(t, os.MkdirAll(filepath.Dir(blob), 0700))
 	require.NoError(t, os.WriteFile(blob, []byte("new checkpoint"), 0600))
-	calls := 0
-	client := acquireClient(t, func(req *http.Request) (*http.Response, error) {
-		calls++
-		require.Equal(t, "/v1/cache/import", req.URL.Path)
-		var body struct {
-			Path, URL, Digest string
-			Size              int64
-		}
-		require.NoError(t, json.NewDecoder(req.Body).Decode(&body))
-		require.Equal(t, blob, body.Path)
-		require.Equal(t, digest.FromString("new checkpoint").String(), body.Digest)
-		require.Equal(t, int64(14), body.Size)
-		return fenceReply(200, `{"ok":true}`), nil
-	})
-	require.NoError(t, cacheCheckpoint(context.Background(), result, dockerConfig{}, artifacts, client))
-	require.Equal(t, 1, calls, "only new local layers are imported")
+
+	require.NoError(t, cacheCheckpoint(result, dockerConfig{}, artifacts))
+	require.NoFileExists(t, blob, "the packed layer moves into the cache")
+	_, cached := blobcache.Hit(global.blobCacheDir, digest.FromString("new checkpoint"), int64(len("new checkpoint")))
+	require.True(t, cached)
+	_, inherited := blobcache.Hit(global.blobCacheDir, digest.FromString("inherited"), int64(len("inherited")))
+	require.False(t, inherited, "an inherited layer stays remote")
 	require.Zero(t, registry.requestCount(), "publication seed must not fetch remote metadata")
 	require.NoError(t, os.RemoveAll(artifacts), "pack staging can be deleted")
 	registry.mu.Lock()
@@ -55,7 +48,7 @@ func TestCheckpointPublicationCacheReusedOfflineAndEvicted(t *testing.T) {
 		require.NoError(t, err)
 	}
 	require.Zero(t, registry.requestCount(), "resume metadata works with registry denied")
-	// Existing metadata GC removes the imported entries. Resolve follows the
+	// Existing metadata GC removes the seeded entries. Resolve follows the
 	// normal remote miss path rather than depending on deleted pack staging.
 	require.NoError(t, trimManifestCache(manifestCacheRoot(), 0, 0))
 	registry.mu.Lock()
@@ -73,9 +66,5 @@ func TestCheckpointCacheRejectsWrongPublishedDigest(t *testing.T) {
 	snapRef := "registry.invalid/team/checkpoint@" + digest.FromBytes(snap).String()
 	metadata, _ := json.Marshal(map[string]any{"oci": ocitemplate.Pair{Rootfs: rootRef, Snapfiles: snapRef}})
 	result := &ocitemplate.PublishedCheckpoint{Reference: ocitemplate.Prefix + snapRef, Metadata: metadata, Manifests: map[string]json.RawMessage{rootRef: snap, snapRef: snap}}
-	client := acquireClient(t, func(*http.Request) (*http.Response, error) {
-		t.Fatal("must not import invalid metadata")
-		return nil, nil
-	})
-	require.ErrorContains(t, cacheCheckpoint(context.Background(), result, dockerConfig{}, t.TempDir(), client), "digest mismatch")
+	require.ErrorContains(t, cacheCheckpoint(result, dockerConfig{}, t.TempDir()), "digest mismatch")
 }

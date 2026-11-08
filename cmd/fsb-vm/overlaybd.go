@@ -10,7 +10,10 @@ import (
 	"strconv"
 	"unsafe"
 
+	"github.com/opencontainers/go-digest"
 	"golang.org/x/sys/unix"
+
+	"fast-sandbox/internal/blobcache"
 )
 
 // OverlayBDBSConfig is overlaybd's device config (config.v1.json). The schema
@@ -26,7 +29,9 @@ type OverlayBDBSConfig struct {
 }
 
 // OverlayBDBSConfigLower is a lower layer entry. Remote layers are addressed
-// by digest+size and fetched from RepoBlobURL at runtime.
+// by digest+size and fetched from RepoBlobURL at runtime. File names a local
+// blob the daemon opens instead; digest and size stay set so a missing file
+// falls back to the remote fetch.
 type OverlayBDBSConfigLower struct {
 	Digest string `json:"digest,omitempty"`
 	Size   int64  `json:"size,omitempty"`
@@ -53,11 +58,32 @@ const (
 	overlaybdResultName = "result"
 )
 
-// lowersFor converts resolved remote layers into config lower entries.
+// blobCacheRoot resolves the local layer cache. The runtime passes a
+// node-scoped directory so every Fastlet on the node shares the bytes; a
+// standalone CLI run keeps the cache beside the sandbox state.
+func blobCacheRoot() string {
+	if global.blobCacheDir != "" {
+		return global.blobCacheDir
+	}
+	return filepath.Join(global.stateDir, ".blob-cache")
+}
+
+// lowersFor converts resolved remote layers into config lower entries. A layer
+// cached on this node also names its local file: overlaybd opens that file
+// instead of fetching the blob, and a missing file fails the access check and
+// falls back to the remote path. Modification time doubles as the cache LRU
+// clock, so a hit is recorded here.
 func lowersFor(image resolvedImage) []OverlayBDBSConfigLower {
+	root := blobCacheRoot()
 	lowers := make([]OverlayBDBSConfigLower, 0, len(image.Lowers))
 	for _, layer := range image.Lowers {
-		lowers = append(lowers, OverlayBDBSConfigLower{Digest: layer.Digest, Size: layer.Size})
+		lower := OverlayBDBSConfigLower{Digest: layer.Digest, Size: layer.Size}
+		if dgst, err := digest.Parse(layer.Digest); err == nil {
+			if path, ok := blobcache.Hit(root, dgst, layer.Size); ok {
+				lower.File = path
+			}
+		}
+		lowers = append(lowers, lower)
 	}
 	return lowers
 }

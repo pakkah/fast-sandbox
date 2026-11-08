@@ -14,6 +14,7 @@ import (
 	"oras.land/oras-go/v2/registry"
 
 	"fast-sandbox/internal/artifacts"
+	"fast-sandbox/internal/blobcache"
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
 	"fast-sandbox/internal/observability"
 	"fast-sandbox/internal/ocitemplate"
@@ -78,6 +79,7 @@ func (d *Driver) fsbArgs() []string {
 	args := []string{
 		"--state-dir", filepath.Join(d.ociRoot(), "sandboxes"),
 		"--manifest-cache-dir", filepath.Join(d.config.StateRoot, "oci/manifest-cache"),
+		"--blob-cache-dir", blobcache.Root(d.config.StateRoot),
 		"--runtime-dir", filepath.Join(d.ociRoot(), "runtime"),
 		"--build-work-dir", filepath.Join(d.ociRoot(), "builds"),
 		"--build-output-dir", filepath.Join(d.ociRoot(), "artifacts"),
